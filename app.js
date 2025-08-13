@@ -2,27 +2,84 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
 import pg from 'pg';
-import bcrypt from 'bcrypt';
-
+import mongoose from 'mongoose';
+import session from 'express-session';
+import passport from 'passport';
+import passportlocalmongoose from 'passport-local-mongoose';
+import pkg from 'passport-google-oauth20';
+const { Strategy: GoogleStrategy } = pkg;
+import findOrCreate from 'mongoose-findorcreate';
 // Load environment variables from .env file
 dotenv.config();
 
 const app = express();
-const PORT =  2000;
+const PORT =  4000;
 
 // Middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const db = new pg.Client({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'userdetail',
-  password: 'william',
-  port: 9000,
+// const db = new pg.Client({
+//   user: 'postgres',
+//   host: 'localhost',
+//   database: 'userdetail',
+//   password: 'william',
+//   port: 9000,
+// });
+// db.connect()
+//     .then(()=>console.log('connected to pg'))
+
+mongoose.connect("mongodb://localhost:27017/userdetail",{ useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+app.use(session({
+  secret: 'secret-key',
+  resave: false,
+  saveUninitialized: true
+}));
+
+app.use(passport.initialize());
+app.use(passport.session());
+
+const userSchema = new mongoose.Schema({
+  username: String,
+  password: String,
+  googleId: String
 });
-db.connect()
-    .then(()=>console.log('connected to pg'))
+
+userSchema.plugin(passportlocalmongoose);
+userSchema.plugin(findOrCreate);
+
+
+const User = mongoose.model('User', userSchema);
+
+passport.use(User.createStrategy());
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+passport.deserializeUser((id, done) => {
+  User.findById(id)
+    .then(user => done(null, user))
+    .catch(err => done(err));
+});
+
+// Google OAuth Strategy
+passport.use(new GoogleStrategy({
+    clientID: process.env.CLIENT_ID,
+    clientSecret: process.env.CLIENT_SECRET,
+    callbackURL: "http://localhost:4000/auth/google/secrets",
+    userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo"
+  },
+  function(accessToken, refreshToken, profile, cb) {
+    console.log(profile);
+    User.findOrCreate({ googleId: profile.id }, function (err, user) {
+      return cb(err, user);
+    });
+    // remeber to install mongoose-findorcreate for the findOrCreate method to work
+  }
+));
+
 // Set view engine
 app.set('view engine', 'ejs');
 
@@ -31,31 +88,29 @@ app.use(express.static('public'));
 app.get('/',(req,res)=>{
     res.render('home.ejs');
 })
+// Google authentication routes
+app.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 
+app.get('/auth/google/secrets', 
+  passport.authenticate('google', { failureRedirect: '/login' }),
+  function(req, res) {
+    // Successful authentication, redirect secrets page.
+    res.redirect('/secrets');
+  });
 // register route
 app.get('/register', (req, res) => {
   res.render('register.ejs');
 });
 app.post('/register',async (req, res) => {
-  const email = req.body.username;
-  const password = req.body.password;
-
-  bcrypt.hash(password, 10, async (err, hash) => {
+  User.register(new User({ username: req.body.username }), req.body.password, (err, user) => {
     if (err) {
-      console.error('Error hashing password:', err);
-      return res.status(500).send('Internal server error');
+      console.error('Registration error:', err);
+      return res.status(500).send('Registration error');
     }
-    try {
-      const query = 'INSERT INTO users (email, password) VALUES ($1, $2)';
-      const values = [email, hash];
-      await db.query(query, values);
-      console.log('user registerd successfully');
-      res.render('secrets.ejs')
-    } catch (error) {
-      console.error('Error inserting user:', error);
-      res.status(500).send('Internal server error');
-    }
-  });
+    passport.authenticate('local')(req, res, () => {
+      res.redirect('/');
+    });
+  })
 })
 // login route
 
@@ -63,42 +118,39 @@ app.get('/login', (req, res) => {
   res.render('login.ejs');
 });
 app.post('/login', async (req, res) => {
-  const email = req.body.username;
-  const password = req.body.password;
-
-  try {
-    // Find user by email
-    const result = await db.query('SELECT * FROM users WHERE email = $1', [email]);
-
-    if (result.rows.length === 0) {
-      return res.status(401).send('Invalid email or password');
+  const user = new User({
+    username: req.body.username,
+    password: req.body.password
+  });
+  req.login(user, (err) => {
+    if (err) {
+      console.error('Login error:', err);
+      return res.status(500).send('Login error');
     }
-
-    const user = result.rows[0];
-
-    // Compare passwords
-    const match = await bcrypt.compare(password, user.password);
-    if (match) {
-      console.log('User logged in successfully');
-      res.render('secrets.ejs');
-    } else {
-      res.status(401).send('Invalid email or password');
-    }
-
-  } catch (error) {
-    console.error('Error during login:', error);
-    res.status(500).send('Internal server error');
-  }
+    passport.authenticate('local')(req, res, () => {
+      res.redirect('secrets');
+    });
+  });
 });
 // logout route
 app.get('/logout', (req, res) => {
-  req.session.destroy((err) => {
+  req.logout((err) => {
     if (err) {
-      console.error('Error destroying session:', err);
-      return res.status(500).send('Error logging out');
+      console.error('Logout error:', err);
+      return res.status(500).send('Logout error');
     }
-    res.redirect('/'); // Redirect to homepage after logout
+    res.redirect('/');
   });
+});
+
+// secrets route
+app.get('/secrets', (req, res) => {
+  if (req.isAuthenticated()) {
+    console.log('user is authenticated:', req.user);
+    res.render('secrets.ejs');
+  } else {
+    res.redirect('/login');
+  }
 });
 
 app.listen(PORT, () => {
